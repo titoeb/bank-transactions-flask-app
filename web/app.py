@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from flask_restful import Api, Resource
 from pymongo import MongoClient
 import bcrypt
-import spacy
+from typing import Any, Dict, Union
 
 # Set-up App
 app = Flask(__name__)
@@ -10,8 +10,8 @@ api = Api(app)
 
 # Initiallize db connection
 client = MongoClient("mongodb://db:27017")
-db = client.SimilarityDB
-users = db["users"]
+db = client.BankAPI
+users = db["Users"]
 
 # Helper functions
 def user_exists(username: str) -> bool:
@@ -27,10 +27,43 @@ def correct_password(username:str, password: str) -> bool:
 
     return bcrypt.hashpw(password.encode("utf8"), hashed_pw) == hashed_pw
 
-def count_tokens(username:str) -> bool:
+def get_field_user(username:str, field: str) -> Any:
     return users.find({
         "Username": username
-        })[0]["Tokens"]
+        })[0][field]
+
+def set_field_user(username: str, field: str, value: Any):
+     users.update({
+            "Username": username
+            }, {"$set":{
+                field: value
+                }
+            })
+
+def cash_with_user(username: str) -> int:
+    return get_field_user(username, "Own")
+
+def debt_with_user(username: str)->int:
+    return get_field_user(username, "Debt")
+
+def update_cash_with_user(username: str, new_cash: int):
+    set_field_user(username, "Own", new_cash)
+
+def update_debt_with_user(username: str, new_debt: int):
+    set_field_user(username, "Debt", new_debt)
+
+def generate_return_dict(status:str, message:str) -> Dict:
+    return {
+            "status": status,
+            "msg": message
+        }
+
+def verify_user(username: str, password: str) -> Union[Dict, None]:
+    if not user_exists(username):
+        return generate_return_dict(301, "Invalid Username")
+
+    if not correct_password(username, password):
+        return generate_return_dict(302, "Invalid Password")
 
 class Register(Resource):
     def post(self):
@@ -53,102 +86,141 @@ class Register(Resource):
         users.insert({
             "Username": username,
             "Password": hashed_password,
-            "Tokens": 6,
+            "Own": 0,
+            "Debt": 0
         })
 
         return(jsonify({
                 "status": 200,
-                "msg": "User was sucessfully created"
+                "msg": "User was sucessfully created."
         }))
 
-class Detect(Resource):
+class Add(Resource):
     def post(self):
         postedData = request.get_json()
-        
-        # Parse inputs
+
         username = postedData["username"]
         password = postedData["password"]
-        text1 = postedData["text1"]
-        text2 = postedData["text2"]
+        amount = postedData["amount"]
 
-        if not user_exists(username):
-            return(jsonify({
-                    "status": 301,
-                    "msg": "The user does not exist."
-                }))
+        error_dict = verify_user(username, password)
+        if error_dict:
+            return(jsonify(error_dict))
+        if amount <= 0:
+            return(jsonify(generate_return_dict(304, "The amount needs to be larger than 0")))
 
-        if not correct_password(username, password):
-            return(jsonify({
-                    "status": 302,
-                    "msg": "The password is wrong!"
-                    }))
-
-        number_tokens = count_tokens(username)
-        if number_tokens <= 0:
-            return(jsonify({
-                    "status": 303,
-                    "msg": "You don't have sufficient tokens!"
-                }))
-
-        # Calculate the edit-distance
-        nlp = spacy.load("en_core_web_sm")    
-        text1_tokenized = nlp(text1)
-        text2_tokenized = nlp(text2)
+        cash = cash_with_user(username)
         
-        similarity = text1_tokenized.similarity(text2_tokenized)
-        
-        users.update({
-            "Username": username
-            }, {"$set":{
-                "Tokens": number_tokens-1
-                }
-            })
+        # From each transaction the bank gets 1 dollar.
+        amount -= 1
+        bank_cash = cash_with_user("BANK")
+        update_cash_with_user("BANK", bank_cash + 1)
 
-        return(jsonify({
-             "status": 200,
-             "similariy": similarity,
-             "msg": "Similarity score calculated"
-            }))
+        # Finalize transaction for the suer
+        update_cash_with_user(username, cash + amount)
+        return(jsonify(generate_return_dict(200, "Money succesfully added to the bank account")))
 
-class Refill(Resource):
+class Transfer(Resource):
     def post(self):
         postedData = request.get_json()
-        
+
         username = postedData["username"]
-        admin_password = postedData["admin_password"]
-        refill_amount = postedData["refill_amount"]
+        password = postedData["password"]
+        amount = postedData["amount"]
+        to = postedData["to"]
+        
+        error_dict = verify_user(username, password)
+        if error_dict:
+            return(jsonify(error_dict))
+        if amount <= 0:
+            return(jsonify(generate_return_dict(304, "The amount needs to be larger than 0")))
+        
+        cash_user = cash_with_user(username)
 
-        if not user_exists(username):
-            return(jsonify({
-                        "status": 301,
-                        "msg": "Invalid Username"
-                    }))
+        if cash_user < amount:
+            return(jsonify(generate_return_dict(304, f"You cannot do this transaction as your current cash is {cash_user} and the transaction amount is {amount} ")))
+        
+        if not user_exists(to):
+            return(jsonify(generate_return_dict("301", f"Receiver {to} is not known!" )))
+        
+        cash_to = cash_with_user(to)
+        cash_bank = cash_with_user("BANK")
 
-        # This pw should be hashed and stored in the database
-        # But for the sake of time let's do it this way:
-        if not admin_password == "admin":
-            return(jsonify({
-                    "status": 304,
-                    "msg": "Invalid admin password"
-                }))
+        update_cash_with_user("BANK", cash_bank + 1)
+        update_cash_with_user(to, cash_to + amount - 1)
+        update_cash_with_user(username, cash_user - amount)
 
-        current_tokens = count_tokens(username)
-        users.update({
-                "Username": username,
-                },{
-                    "$set": {
-                            "Tokens": refill_amount + current_tokens
-                        }
-            })
-        message = f"Congratulations, you now have {count_tokens(username)} Tokens!"
+        return(jsonify(generate_return_dict(200, "The money was sucessfully transfered")))
+
+class Balance(Resource):
+    def post(self):
+        postedData = request.get_json()
+
+        username = postedData["username"]
+        password = postedData["password"]
+        
+        error_dict = verify_user(username, password)
+        if error_dict:
+            return(jsonify(error_dict))
+        
+        cash_user = cash_with_user(username)
+        debt_user = debt_with_user(username)
+
         return(jsonify({
-                "status": 200, 
-                "msg": message
+                "status": 200,
+                "msg": "success",
+                "cash": cash_user,
+                "debt": debt_user
             }))
 
+class TakeLoan(Resource):
+    def post(self):
+
+        postedData = request.get_json()
+        username = postedData["username"]
+        password = postedData["password"]
+        loan = postedData["amount"]
+        
+        error_dict = verify_user(username, password)
+        if error_dict:
+            return(jsonify(error_dict))
+        
+        cash_user = cash_with_user(username)
+        debt_user = debt_with_user(username)
+        update_cash_with_user(username, cash_user + loan)
+        update_debt_with_user(username, debt_user + loan)
+        
+        return jsonify(generate_return_dict(200, "Loan added to your account."))
+
+class PayLoan(Resource):
+    def post(self):
+
+        postedData = request.get_json()
+        username = postedData["username"]
+        password = postedData["password"]
+        amount = postedData["amount"]
+        
+        error_dict = verify_user(username, password)
+        if error_dict:
+            return(jsonify(error_dict))
+        
+        cash_user = cash_with_user(username)
+        debt_user = debt_with_user(username)
+    
+        if cash_user < amount:
+            return(jsonify(generate_return_dict(303, "Insufficient Funds!")))
+
+        update_cash_with_user(username, cash_user - amount)
+        update_debt_with_user(username, debt_user - amount)
+        
+        return jsonify(generate_return_dict(200, "Loan was removed from you account"))
+
 api.add_resource(Register, "/register")
-api.add_resource(Detect, "/detect")
-api.add_resource(Refill, "/refill")
+api.add_resource(Add, "/add")
+api.add_resource(Transfer, "/transfer")
+api.add_resource(Balance, "/balance")
+api.add_resource(TakeLoan, "/takeloan")
+api.add_resource(PayLoan, "/payloan")
 
 if __name__ == "__main__":
     	app.run(debug=True)
